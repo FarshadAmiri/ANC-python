@@ -59,7 +59,7 @@ for i in range(0, len(audio), FRAME_SIZE):
     enhanced[i:i+FRAME_SIZE] = outbuf[:len(chunk)]
 
 # Save to WAV
-sf.write("denoised.wav", enhanced, SAMPLERATE)
+sf.write(r"D:\Git_repos\ANC-python\denoised.wav", enhanced, SAMPLERATE)
 print("Saved denoised.wav")
 
 # Clean up
