@@ -477,20 +477,17 @@ class DeepFilterNet2(nn.Module):
         
         # Apply masks to magnitude with hybrid approach combining neural and classical methods
         
-        # Apply a proven classical approach that works well
-        # Use primarily classical methods with neural network as fine-tuning
+        # Simplified but effective approach focused on aggressive noise reduction
+        # Use proven spectral subtraction with minimal complexity
         
-        # 1. Classical spectral subtraction as baseline
-        classical_enhanced = self._apply_classical_spectral_subtraction(magnitude)
+        # 1. Estimate noise spectrum aggressively
+        noise_est = self._estimate_aggressive_noise(magnitude)
         
-        # 2. Apply Wiener filtering for additional enhancement
-        wiener_enhanced = self._apply_classical_wiener_filter(magnitude, classical_enhanced)
+        # 2. Apply aggressive spectral subtraction
+        enhanced_magnitude = self._apply_aggressive_spectral_subtraction(magnitude, noise_est)
         
-        # 3. Neural network fine-tuning (light touch)
-        neural_enhanced = wiener_enhanced * (0.8 + 0.2 * mask_real)  # Gentle neural adjustment
-        
-        # 4. Final spectral gating for artifact removal
-        enhanced_magnitude = self._apply_final_spectral_gating(neural_enhanced)
+        # 3. Apply speech preservation for important frequencies
+        enhanced_magnitude = self._preserve_speech_frequencies(magnitude, enhanced_magnitude)
         
         # Enhanced phase with conservative adjustment
         phase_adjustment = phase_residual * mask_imag * 0.05  # Very conservative phase changes
@@ -516,7 +513,97 @@ class DeepFilterNet2(nn.Module):
         
         return enhanced
     
-    def _apply_classical_spectral_subtraction(self, magnitude: torch.Tensor) -> torch.Tensor:
+    def _estimate_aggressive_noise(self, magnitude: torch.Tensor) -> torch.Tensor:
+        """Aggressively estimate noise spectrum for maximum noise reduction."""
+        batch_size, freq_bins, time_frames = magnitude.shape
+        
+        # Multiple noise estimation strategies
+        noise_estimates = []
+        
+        # Strategy 1: First 20% of frames (assuming noise is present)
+        first_frames = max(1, time_frames // 5)
+        noise_1 = torch.mean(magnitude[:, :, :first_frames], dim=2, keepdim=True)
+        noise_estimates.append(noise_1)
+        
+        # Strategy 2: Minimum over time (very aggressive)
+        noise_2 = torch.min(magnitude, dim=2, keepdim=True)[0]
+        noise_estimates.append(noise_2)
+        
+        # Strategy 3: Low percentile (conservative minimum)
+        if time_frames > 3:
+            noise_3 = torch.quantile(magnitude, 0.1, dim=2, keepdim=True)
+            noise_estimates.append(noise_3)
+        
+        # Use the maximum of these estimates (conservative approach)
+        noise_spectrum = noise_estimates[0]
+        for noise_est in noise_estimates[1:]:
+            noise_spectrum = torch.maximum(noise_spectrum, noise_est)
+        
+        # Ensure noise estimate isn't too high (max 50% of average signal)
+        avg_signal = torch.mean(magnitude, dim=2, keepdim=True)
+        noise_spectrum = torch.minimum(noise_spectrum, 0.5 * avg_signal)
+        
+        return noise_spectrum
+    
+    def _apply_aggressive_spectral_subtraction(self, magnitude: torch.Tensor, noise_est: torch.Tensor) -> torch.Tensor:
+        """Apply aggressive spectral subtraction optimized for noise reduction."""
+        freq_bins = magnitude.shape[1]
+        nyquist = self.sr / 2
+        
+        # Frequency-dependent over-subtraction factors (aggressive but preserving speech)
+        over_sub = torch.ones_like(noise_est)
+        
+        for i in range(freq_bins):
+            freq = i * nyquist / freq_bins
+            
+            if freq < 100:  # Very low freq - remove almost completely
+                over_sub[:, i] = 8.0
+            elif 100 <= freq < 300:  # Low freq - very aggressive
+                over_sub[:, i] = 5.0
+            elif 300 <= freq <= 1000:  # Core speech - moderate but effective
+                over_sub[:, i] = 3.0
+            elif 1000 < freq <= 3400:  # Upper speech - moderate
+                over_sub[:, i] = 3.5
+            elif 3400 < freq <= 8000:  # Extended speech - aggressive
+                over_sub[:, i] = 4.0
+            else:  # High freq - very aggressive
+                over_sub[:, i] = 6.0
+        
+        # Apply spectral subtraction
+        subtracted = magnitude - over_sub * noise_est
+        
+        # Aggressive spectral floor (lower than typical)
+        spectral_floor = 0.05 * magnitude  # Only 5% of original
+        
+        # Apply floor
+        enhanced = torch.maximum(subtracted, spectral_floor)
+        
+        return enhanced
+    
+    def _preserve_speech_frequencies(self, original: torch.Tensor, enhanced: torch.Tensor) -> torch.Tensor:
+        """Preserve important speech frequencies while maintaining noise reduction."""
+        freq_bins = original.shape[1]
+        nyquist = self.sr / 2
+        
+        # Create frequency-dependent preservation mask
+        preservation = torch.ones_like(enhanced)
+        
+        for i in range(freq_bins):
+            freq = i * nyquist / freq_bins
+            
+            if 300 <= freq <= 3400:  # Core speech frequencies
+                # Less aggressive processing for speech
+                alpha = 0.7  # 70% processed, 30% original
+                preservation[:, i] = alpha * enhanced[:, i] + (1 - alpha) * original[:, i]
+            elif 80 <= freq <= 8000:  # Extended speech range
+                # Moderate preservation
+                alpha = 0.85  # 85% processed, 15% original  
+                preservation[:, i] = alpha * enhanced[:, i] + (1 - alpha) * original[:, i]
+            else:
+                # Keep aggressive processing for non-speech frequencies
+                preservation[:, i] = enhanced[:, i]
+        
+        return preservation
         """Apply enhanced classical spectral subtraction for robust noise reduction."""
         batch_size, freq_bins, time_frames = magnitude.shape
         
