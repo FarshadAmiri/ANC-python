@@ -225,8 +225,10 @@ class DeepFilterNet2(nn.Module):
         # ERB filterbank for perceptual processing
         self.erb_filterbank = ERBFilterBank(sr, n_fft, n_erb)
         
-        # Feature extraction
-        self.feature_dim = self.freq_bins + n_erb
+        # Feature extraction - updated for enhanced features
+        # Features: magnitude + log_mag + delta + erb + contrast + harmonic + snr
+        # = freq_bins + freq_bins + freq_bins + n_erb + 8 + 1 + freq_bins
+        self.feature_dim = 4 * self.freq_bins + n_erb + 9  # Added contrast bands and harmonic features
         
         # Complex neural networks
         self.complex_lstm = ComplexLSTM(
@@ -301,7 +303,7 @@ class DeepFilterNet2(nn.Module):
     
     def extract_features(self, magnitude: torch.Tensor) -> torch.Tensor:
         """
-        Extract combined linear and ERB features.
+        Extract advanced spectral features for better speech/noise discrimination.
         
         Args:
             magnitude: Magnitude spectrum [batch, freq_bins, time]
@@ -309,14 +311,128 @@ class DeepFilterNet2(nn.Module):
         Returns:
             Combined features [batch, time, feature_dim]
         """
-        # ERB features
+        batch_size, freq_bins, time_frames = magnitude.shape
+        
+        # 1. ERB features for perceptual processing
         erb_features = self.erb_filterbank(magnitude)  # [batch, n_erb, time]
         
-        # Combine linear and ERB features
-        combined = torch.cat([magnitude, erb_features], dim=1)  # [batch, freq_bins + n_erb, time]
+        # 2. Log magnitude for better dynamic range
+        log_magnitude = torch.log(magnitude + 1e-8)
+        
+        # 3. Spectral derivatives for temporal dynamics
+        if time_frames > 1:
+            mag_delta = magnitude[:, :, 1:] - magnitude[:, :, :-1]
+            mag_delta = F.pad(mag_delta, (1, 0), mode='replicate')  # Pad to maintain size
+        else:
+            mag_delta = torch.zeros_like(magnitude)
+        
+        # 4. Spectral contrast for speech characterization
+        spectral_contrast = self._compute_spectral_contrast(magnitude)
+        
+        # 5. Harmonic features for speech detection
+        harmonic_features = self._compute_harmonic_features(magnitude)
+        
+        # 6. Noise floor estimation
+        noise_floor = self._estimate_noise_floor(magnitude)
+        snr_est = magnitude / (noise_floor + 1e-8)
+        snr_est = torch.log(torch.clamp(snr_est, 0.1, 100.0))
+        
+        # Combine all features
+        combined = torch.cat([
+            magnitude,           # Original magnitude
+            log_magnitude,       # Log magnitude  
+            mag_delta,           # Temporal derivatives
+            erb_features,        # ERB features
+            spectral_contrast,   # Spectral contrast
+            harmonic_features,   # Harmonic features
+            snr_est             # SNR estimation
+        ], dim=1)
         
         # Transpose for LSTM: [batch, time, features]
         return combined.transpose(1, 2)
+    
+    def _compute_spectral_contrast(self, magnitude: torch.Tensor) -> torch.Tensor:
+        """Compute spectral contrast features."""
+        # Divide spectrum into sub-bands for contrast computation
+        freq_bins = magnitude.shape[1]
+        n_bands = 8
+        band_size = freq_bins // n_bands
+        
+        contrast_features = []
+        for i in range(n_bands):
+            start_bin = i * band_size
+            end_bin = min((i + 1) * band_size, freq_bins)
+            
+            if end_bin > start_bin:
+                band_magnitude = magnitude[:, start_bin:end_bin, :]
+                
+                # Peak and valley detection in sub-band
+                peak = torch.max(band_magnitude, dim=1, keepdim=True)[0]
+                valley = torch.mean(band_magnitude, dim=1, keepdim=True) * 0.1
+                
+                # Spectral contrast
+                contrast = peak - valley
+                contrast_features.append(contrast)
+        
+        if contrast_features:
+            return torch.cat(contrast_features, dim=1)
+        else:
+            return torch.zeros(magnitude.shape[0], 1, magnitude.shape[2], device=magnitude.device)
+    
+    def _compute_harmonic_features(self, magnitude: torch.Tensor) -> torch.Tensor:
+        """Compute harmonic features to distinguish speech from noise."""
+        freq_bins = magnitude.shape[1]
+        nyquist = self.sr / 2
+        
+        # Focus on typical speech fundamental frequency range (80-400 Hz)
+        f0_min, f0_max = 80, 400
+        f0_bin_min = int(f0_min * freq_bins / nyquist)
+        f0_bin_max = int(f0_max * freq_bins / nyquist)
+        
+        harmonic_features = []
+        
+        # Compute harmonic strength for different F0 candidates
+        for f0_bin in range(f0_bin_min, min(f0_bin_max, freq_bins // 6)):
+            harmonic_sum = magnitude[:, f0_bin:f0_bin+1, :]  # Fundamental
+            
+            # Add harmonics (2f0, 3f0, 4f0, 5f0)
+            for harmonic in range(2, 6):
+                harmonic_bin = f0_bin * harmonic
+                if harmonic_bin < freq_bins:
+                    harmonic_sum = harmonic_sum + magnitude[:, harmonic_bin:harmonic_bin+1, :]
+            
+            harmonic_features.append(harmonic_sum)
+        
+        if harmonic_features:
+            # Take maximum harmonic strength across F0 candidates
+            harmonic_strength = torch.stack(harmonic_features, dim=1)
+            harmonic_max = torch.max(harmonic_strength, dim=1)[0]
+            return harmonic_max
+        else:
+            return torch.zeros(magnitude.shape[0], 1, magnitude.shape[2], device=magnitude.device)
+    
+    def _estimate_noise_floor(self, magnitude: torch.Tensor) -> torch.Tensor:
+        """Estimate noise floor for SNR computation."""
+        # Use minimum statistics over time for noise floor estimation
+        if magnitude.shape[2] > 1:
+            # Use percentile for robustness
+            noise_floor = torch.quantile(magnitude, 0.1, dim=2, keepdim=True)
+        else:
+            noise_floor = magnitude * 0.1
+        
+        # Smooth across frequency for stability
+        if magnitude.shape[1] > 3:
+            # Simple smoothing using neighboring frequency bins
+            noise_floor_smooth = torch.zeros_like(noise_floor)
+            noise_floor_smooth[:, 0] = noise_floor[:, 0]
+            noise_floor_smooth[:, -1] = noise_floor[:, -1]
+            
+            for i in range(1, noise_floor.shape[1] - 1):
+                noise_floor_smooth[:, i] = (noise_floor[:, i-1] + noise_floor[:, i] + noise_floor[:, i+1]) / 3
+                
+            return noise_floor_smooth
+        
+        return noise_floor
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -359,31 +475,29 @@ class DeepFilterNet2(nn.Module):
         mask_imag = mask_imag.transpose(1, 2)
         phase_residual = phase_residual.transpose(1, 2)
         
-        # Apply masks to magnitude
-        enhanced_magnitude = magnitude * mask_real
+        # Apply masks to magnitude with hybrid approach combining neural and classical methods
         
-        # Apply additional spectral subtraction for noise reduction
-        noise_threshold = 0.1
-        noise_mask = (enhanced_magnitude < (noise_threshold * magnitude))
-        enhanced_magnitude = torch.where(
-            noise_mask,
-            enhanced_magnitude * 0.1,  # Strongly suppress likely noise
-            enhanced_magnitude
-        )
+        # Apply a proven classical approach that works well
+        # Use primarily classical methods with neural network as fine-tuning
         
-        # Smooth mask to avoid artifacts
-        smoothing_kernel = torch.ones(1, 1, 3, device=enhanced_magnitude.device) / 3
-        if enhanced_magnitude.dim() == 2:
-            enhanced_magnitude = enhanced_magnitude.unsqueeze(0).unsqueeze(0)
-            enhanced_magnitude = F.conv2d(
-                enhanced_magnitude, 
-                smoothing_kernel, 
-                padding=(0, 1)
-            ).squeeze(0).squeeze(0)
+        # 1. Classical spectral subtraction as baseline
+        classical_enhanced = self._apply_classical_spectral_subtraction(magnitude)
+        
+        # 2. Apply Wiener filtering for additional enhancement
+        wiener_enhanced = self._apply_classical_wiener_filter(magnitude, classical_enhanced)
+        
+        # 3. Neural network fine-tuning (light touch)
+        neural_enhanced = wiener_enhanced * (0.8 + 0.2 * mask_real)  # Gentle neural adjustment
+        
+        # 4. Final spectral gating for artifact removal
+        enhanced_magnitude = self._apply_final_spectral_gating(neural_enhanced)
         
         # Enhanced phase with conservative adjustment
-        phase_adjustment = phase_residual * mask_imag * 0.1  # More conservative phase changes
+        phase_adjustment = phase_residual * mask_imag * 0.05  # Very conservative phase changes
         enhanced_phase = phase + phase_adjustment
+        
+        # Apply phase consistency constraints
+        enhanced_phase = self._ensure_phase_consistency(enhanced_phase)
         
         # Reconstruct complex spectrum
         enhanced_real = enhanced_magnitude * torch.cos(enhanced_phase)
@@ -393,9 +507,269 @@ class DeepFilterNet2(nn.Module):
         # ISTFT
         enhanced = self.istft(enhanced_complex)
         
+        # Post-processing for additional quality improvement
+        enhanced = self._post_process_audio(enhanced, x)
+        
         # Restore original shape
         if len(input_shape) == 1:
             enhanced = enhanced.squeeze(0)
+        
+        return enhanced
+    
+    def _apply_classical_spectral_subtraction(self, magnitude: torch.Tensor) -> torch.Tensor:
+        """Apply enhanced classical spectral subtraction for robust noise reduction."""
+        batch_size, freq_bins, time_frames = magnitude.shape
+        
+        # Enhanced noise estimation using multiple methods
+        # Method 1: Use first few frames
+        noise_frames = min(15, time_frames // 3)
+        if noise_frames > 0:
+            initial_noise = torch.mean(magnitude[:, :, :noise_frames], dim=2, keepdim=True)
+        else:
+            initial_noise = magnitude.mean(dim=2, keepdim=True) * 0.1
+        
+        # Method 2: Minimum statistics over time
+        if time_frames > 5:
+            min_noise = torch.quantile(magnitude, 0.02, dim=2, keepdim=True)  # Very low percentile
+        else:
+            min_noise = magnitude * 0.1
+        
+        # Method 3: Smooth tracking
+        if time_frames > 1:
+            median_noise = torch.median(magnitude, dim=2, keepdim=True)[0]
+            tracking_noise = 0.1 * median_noise
+        else:
+            tracking_noise = magnitude * 0.1
+        
+        # Combine noise estimates (conservative approach)
+        noise_spectrum = torch.maximum(initial_noise, min_noise)
+        noise_spectrum = torch.minimum(noise_spectrum, tracking_noise * 3)  # Prevent over-estimation
+        
+        # Advanced frequency-dependent processing
+        nyquist = self.sr / 2
+        enhanced = torch.zeros_like(magnitude)
+        
+        for i in range(freq_bins):
+            freq = i * nyquist / freq_bins
+            
+            # Frequency-specific parameters
+            if freq < 80:  # Very low frequencies - remove completely
+                over_sub = 6.0
+                floor_factor = 0.02
+            elif 80 <= freq < 300:  # Low frequencies - aggressive
+                over_sub = 4.0
+                floor_factor = 0.05
+            elif 300 <= freq <= 3400:  # Speech band - conservative but effective
+                over_sub = 2.5
+                floor_factor = 0.15
+            elif 3400 < freq <= 8000:  # Extended speech - moderate
+                over_sub = 3.0
+                floor_factor = 0.08
+            else:  # High frequencies - very aggressive
+                over_sub = 5.0
+                floor_factor = 0.03
+            
+            # Apply spectral subtraction for this frequency bin
+            noise_est = noise_spectrum[:, i:i+1, :]
+            original = magnitude[:, i:i+1, :]
+            
+            # Multi-band spectral subtraction
+            subtracted = original - over_sub * noise_est
+            
+            # Adaptive spectral floor
+            spectral_floor = floor_factor * original
+            
+            # Apply floor and smooth transition
+            enhanced[:, i:i+1, :] = torch.maximum(subtracted, spectral_floor)
+        
+        # Post-processing for additional quality
+        # Temporal smoothing to reduce musical noise
+        if time_frames > 3:
+            enhanced_smooth = torch.zeros_like(enhanced)
+            enhanced_smooth[:, :, 0] = enhanced[:, :, 0]
+            enhanced_smooth[:, :, -1] = enhanced[:, :, -1]
+            
+            for t in range(1, time_frames - 1):
+                enhanced_smooth[:, :, t] = (enhanced[:, :, t-1] + 2*enhanced[:, :, t] + enhanced[:, :, t+1]) / 4
+            
+            # Blend original and smoothed
+            enhanced = 0.7 * enhanced_smooth + 0.3 * enhanced
+        
+        return enhanced
+    
+    def _apply_classical_wiener_filter(self, original: torch.Tensor, spectral_sub: torch.Tensor) -> torch.Tensor:
+        """Apply classical Wiener filtering for additional noise reduction."""
+        # Estimate signal and noise power spectral densities
+        signal_psd = spectral_sub ** 2
+        
+        # Estimate noise from the difference
+        noise_psd = (original - spectral_sub) ** 2
+        noise_psd = torch.maximum(noise_psd, 0.01 * original ** 2)  # Ensure positive
+        
+        # Wiener gain calculation
+        total_psd = signal_psd + noise_psd
+        wiener_gain = signal_psd / (total_psd + 1e-8)
+        
+        # Smooth the gain to avoid artifacts
+        if original.shape[2] > 3:  # Temporal smoothing
+            gain_smooth = torch.zeros_like(wiener_gain)
+            gain_smooth[:, :, 0] = wiener_gain[:, :, 0]
+            gain_smooth[:, :, -1] = wiener_gain[:, :, -1]
+            
+            for t in range(1, original.shape[2] - 1):
+                gain_smooth[:, :, t] = (wiener_gain[:, :, t-1] + 2*wiener_gain[:, :, t] + wiener_gain[:, :, t+1]) / 4
+            
+            wiener_gain = gain_smooth
+        
+        # Apply gain with limits
+        wiener_gain = torch.clamp(wiener_gain, 0.05, 1.0)  # Limit gain range
+        
+        return original * wiener_gain
+    
+    def _apply_final_spectral_gating(self, magnitude: torch.Tensor) -> torch.Tensor:
+        """Apply final spectral gating to remove remaining artifacts."""
+        # Dynamic threshold based on local statistics
+        if magnitude.shape[2] > 5:
+            # Compute local energy
+            local_energy = F.avg_pool1d(
+                magnitude.mean(dim=1, keepdim=True).transpose(1, 2), 
+                kernel_size=5, stride=1, padding=2
+            ).transpose(1, 2)
+            
+            # Adaptive threshold
+            threshold = 0.1 * local_energy.expand_as(magnitude)
+        else:
+            # Simple threshold for short signals
+            threshold = 0.1 * magnitude.mean(dim=2, keepdim=True)
+        
+        # Apply soft gating
+        gate = torch.sigmoid(10 * (magnitude - threshold))
+        gated = magnitude * gate
+        
+        # Ensure minimum level to avoid complete silence
+        min_level = 0.02 * magnitude
+        return torch.maximum(gated, min_level)
+    
+    def _apply_spectral_gating(self, magnitude: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Apply frequency-dependent spectral gating."""
+        # Basic masking
+        enhanced = magnitude * mask
+        
+        # Frequency-dependent noise floor
+        freq_bins = magnitude.shape[1]
+        nyquist = self.sr / 2
+        noise_floor = torch.zeros_like(enhanced)
+        
+        for i in range(freq_bins):
+            freq = i * nyquist / freq_bins
+            if freq < 100:  # Low frequencies - aggressive suppression
+                noise_floor[:, i] = 0.05 * magnitude[:, i]
+            elif 300 <= freq <= 3400:  # Speech band - minimal suppression
+                noise_floor[:, i] = 0.3 * magnitude[:, i]
+            elif freq < 8000:  # Extended speech - moderate suppression
+                noise_floor[:, i] = 0.2 * magnitude[:, i]
+            else:  # High frequencies - aggressive suppression
+                noise_floor[:, i] = 0.1 * magnitude[:, i]
+        
+        # Apply noise floor
+        enhanced = torch.maximum(enhanced, noise_floor)
+        
+        return enhanced
+        """Apply frequency-dependent spectral gating."""
+        # Basic masking
+        enhanced = magnitude * mask
+        
+        # Frequency-dependent noise floor
+        freq_bins = magnitude.shape[1]
+        nyquist = self.sr / 2
+        noise_floor = torch.zeros_like(enhanced)
+        
+        for i in range(freq_bins):
+            freq = i * nyquist / freq_bins
+            if freq < 100:  # Low frequencies - aggressive suppression
+                noise_floor[:, i] = 0.05 * magnitude[:, i]
+            elif 300 <= freq <= 3400:  # Speech band - minimal suppression
+                noise_floor[:, i] = 0.3 * magnitude[:, i]
+            elif freq < 8000:  # Extended speech - moderate suppression
+                noise_floor[:, i] = 0.2 * magnitude[:, i]
+            else:  # High frequencies - aggressive suppression
+                noise_floor[:, i] = 0.1 * magnitude[:, i]
+        
+        # Apply noise floor
+        enhanced = torch.maximum(enhanced, noise_floor)
+        
+        return enhanced
+    
+    def _apply_wiener_filter(self, original: torch.Tensor, enhanced: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Apply Wiener-like filtering for additional noise suppression."""
+        # Estimate SNR from mask
+        snr_est = mask / (1 - mask + 1e-8)
+        snr_est = torch.clamp(snr_est, 0.1, 10.0)
+        
+        # Wiener gain
+        wiener_gain = snr_est / (snr_est + 1)
+        
+        # Apply wiener filtering
+        wiener_enhanced = original * wiener_gain
+        
+        # Blend with mask-based enhancement
+        alpha = 0.7  # Weight for mask-based processing
+        final_enhanced = alpha * enhanced + (1 - alpha) * wiener_enhanced
+        
+        return final_enhanced
+    
+    def _smooth_magnitude(self, magnitude: torch.Tensor) -> torch.Tensor:
+        """Apply temporal and spectral smoothing to reduce artifacts."""
+        # Spectral smoothing (frequency domain)
+        if magnitude.shape[1] > 3:  # Need at least 3 frequency bins
+            # Simple smoothing using neighboring frequency bins
+            magnitude_smooth = torch.zeros_like(magnitude)
+            magnitude_smooth[:, 0] = magnitude[:, 0]
+            magnitude_smooth[:, -1] = magnitude[:, -1]
+            
+            for i in range(1, magnitude.shape[1] - 1):
+                magnitude_smooth[:, i] = (magnitude[:, i-1] + magnitude[:, i] + magnitude[:, i+1]) / 3
+        else:
+            magnitude_smooth = magnitude
+        
+        # Blend original and smoothed
+        alpha = 0.3  # Smoothing strength
+        return alpha * magnitude_smooth + (1 - alpha) * magnitude
+    
+    def _ensure_phase_consistency(self, phase: torch.Tensor) -> torch.Tensor:
+        """Ensure phase consistency across time frames."""
+        # Simple phase unwrapping approximation
+        if phase.shape[-1] > 1:  # Need at least 2 time frames
+            # Compute phase difference
+            phase_diff = phase[:, :, 1:] - phase[:, :, :-1]
+            
+            # Wrap phase differences to [-π, π]
+            phase_diff = torch.angle(torch.exp(1j * phase_diff))
+            
+            # Reconstruct phase
+            phase_consistent = torch.zeros_like(phase)
+            phase_consistent[:, :, 0] = phase[:, :, 0]
+            for t in range(1, phase.shape[-1]):
+                phase_consistent[:, :, t] = phase_consistent[:, :, t-1] + phase_diff[:, :, t-1]
+        else:
+            phase_consistent = phase
+        
+        return phase_consistent
+    
+    def _post_process_audio(self, enhanced: torch.Tensor, original: torch.Tensor) -> torch.Tensor:
+        """Post-process audio for quality improvement."""
+        # Ensure similar energy levels
+        original_energy = torch.mean(original ** 2, dim=-1, keepdim=True)
+        enhanced_energy = torch.mean(enhanced ** 2, dim=-1, keepdim=True)
+        
+        # Normalize energy but limit the adjustment
+        energy_ratio = torch.sqrt(original_energy / (enhanced_energy + 1e-8))
+        energy_ratio = torch.clamp(energy_ratio, 0.3, 2.0)  # Limit energy changes
+        
+        enhanced = enhanced * energy_ratio
+        
+        # Soft limiting to prevent clipping
+        enhanced = torch.tanh(enhanced * 0.95) / 0.95
         
         return enhanced
     
@@ -498,27 +872,61 @@ def _init_pretrained_weights(model: DeepFilterNet2):
             nn.init.zeros_(module.cross_imag_to_real.bias)
         
         elif isinstance(module, nn.Linear):
-            if any(name in str(module) for name in ['mask_net_real', 'mask_net']):
-                # Real mask should preserve speech
-                nn.init.xavier_uniform_(module.weight, gain=0.1)
+            input_dim = module.in_features
+            output_dim = module.out_features
+            
+            # Find which network this linear layer belongs to by checking parent module names
+            parent_name = ""
+            for name, parent_module in model.named_modules():
+                if module in parent_module.modules():
+                    parent_name = name
+                    break
+            
+            if 'mask_net_real' in parent_name:
+                # Real mask: favor signal preservation with frequency-specific bias
+                nn.init.xavier_uniform_(module.weight, gain=0.3)
                 if module.bias is not None:
-                    if hasattr(module, 'out_features') and module.out_features == model.freq_bins:
-                        # Output layer - bias towards preserving signal
-                        nn.init.constant_(module.bias, 0.9)  # Higher bias for better preservation
+                    if output_dim == model.freq_bins:  # Output layer
+                        # Initialize bias based on frequency importance for speech
+                        bias_values = torch.zeros(output_dim)
+                        nyquist = model.sr / 2
+                        for i in range(output_dim):
+                            freq = i * nyquist / output_dim
+                            if 300 <= freq <= 3400:  # Primary speech band
+                                bias_values[i] = 1.2  # Strong preservation
+                            elif 80 <= freq <= 8000:  # Extended speech band
+                                bias_values[i] = 0.8  # Moderate preservation
+                            else:
+                                bias_values[i] = 0.3  # Noise suppression
+                        module.bias.data = bias_values
                     else:
                         nn.init.constant_(module.bias, 0.5)
-            elif 'mask_net_imag' in str(module):
-                # Imaginary mask for phase adjustment
-                nn.init.xavier_uniform_(module.weight, gain=0.05)
+                        
+            elif 'mask_net_imag' in parent_name:
+                # Imaginary mask: more aggressive noise suppression
+                nn.init.xavier_uniform_(module.weight, gain=0.2)
                 if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)  # No phase bias initially
-            elif 'phase_net' in str(module):
-                # Phase network should be conservative
-                nn.init.xavier_uniform_(module.weight, gain=0.01)
+                    if output_dim == model.freq_bins:
+                        bias_values = torch.zeros(output_dim)
+                        nyquist = model.sr / 2
+                        for i in range(output_dim):
+                            freq = i * nyquist / output_dim
+                            if 300 <= freq <= 3400:
+                                bias_values[i] = 0.1  # Conservative for speech
+                            else:
+                                bias_values[i] = -0.2  # Noise suppression
+                        module.bias.data = bias_values
+                    else:
+                        nn.init.zeros_(module.bias)
+                        
+            elif 'phase_net' in parent_name:
+                # Phase network: very conservative
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             else:
-                nn.init.xavier_uniform_(module.weight)
+                # General linear layers
+                nn.init.kaiming_uniform_(module.weight, mode='fan_in', nonlinearity='relu')
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         
